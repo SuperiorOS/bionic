@@ -32,7 +32,10 @@
 #include <system_properties/prop_area.h>
 #include <system_properties/system_properties.h>
 
+#include <string.h>
+
 #include "private/bionic_defs.h"
+#include "custom_rom_hide.h"
 
 static SystemProperties system_properties;
 static_assert(__is_trivially_constructible(SystemProperties),
@@ -66,12 +69,39 @@ uint32_t __system_property_area_serial() {
 
 __BIONIC_WEAK_FOR_NATIVE_BRIDGE
 const prop_info* __system_property_find(const char* name) {
+  if (custom_rom_hide_should_hide_prop(name)) {
+    return nullptr;
+  }
   return system_properties.Find(name);
 }
 
 __BIONIC_WEAK_FOR_NATIVE_BRIDGE
 int __system_property_read(const prop_info* pi, char* name, char* value) {
-  return system_properties.Read(pi, name, value);
+  int len = system_properties.Read(pi, name, value);
+  if (name && custom_rom_hide_should_spoof_prop(name, value)) {
+    return strlen(value);
+  }
+  return len;
+}
+
+struct ReadCallbackOverrideCtx {
+    void (*original_callback)(void* cookie, const char* name, const char* value, uint32_t serial);
+    void* original_cookie;
+};
+
+static void read_callback_intercept(void* cookie, const char* name, const char* value,
+                                    uint32_t serial) {
+    auto* ctx = static_cast<ReadCallbackOverrideCtx*>(cookie);
+    if (custom_rom_hide_should_hide_prop(name)) {
+        ctx->original_callback(ctx->original_cookie, name, "", serial);
+        return;
+    }
+    const char* override_val = custom_rom_hide_get_prop_override(name);
+    if (override_val) {
+        ctx->original_callback(ctx->original_cookie, name, override_val, serial);
+    } else {
+        ctx->original_callback(ctx->original_cookie, name, value, serial);
+    }
 }
 
 __BIONIC_WEAK_FOR_NATIVE_BRIDGE
@@ -79,12 +109,17 @@ void __system_property_read_callback(const prop_info* pi,
                                      void (*callback)(void* cookie, const char* name,
                                                       const char* value, uint32_t serial),
                                      void* cookie) {
-  return system_properties.ReadCallback(pi, callback, cookie);
+  ReadCallbackOverrideCtx ctx{callback, cookie};
+  return system_properties.ReadCallback(pi, read_callback_intercept, &ctx);
 }
 
 __BIONIC_WEAK_FOR_NATIVE_BRIDGE
 int __system_property_get(const char* name, char* value) {
-  return system_properties.Get(name, value);
+  int len = system_properties.Get(name, value);
+  if (custom_rom_hide_should_spoof_prop(name, value)) {
+    return strlen(value);
+  }
+  return len;
 }
 
 __BIONIC_WEAK_FOR_NATIVE_BRIDGE
@@ -125,9 +160,35 @@ const prop_info* __system_property_find_nth(unsigned n) {
   return system_properties.FindNth(n);
 }
 
+struct ForeachOverrideCtx {
+    void (*original_callback)(const prop_info* pi, void* cookie);
+    void* original_cookie;
+};
+
+struct ForeachReadCtx {
+    const prop_info* pi;
+    ForeachOverrideCtx* foreach_ctx;
+};
+
+static void foreach_read_callback(void* cookie, const char* name, const char*, uint32_t) {
+    auto* ctx = static_cast<ForeachReadCtx*>(cookie);
+    if (custom_rom_hide_should_hide_prop(name)) {
+        return;
+    }
+    ctx->foreach_ctx->original_callback(ctx->pi, ctx->foreach_ctx->original_cookie);
+}
+
+static void foreach_callback_intercept(const prop_info* pi, void* cookie) {
+    auto* ctx = static_cast<ForeachOverrideCtx*>(cookie);
+    ForeachReadCtx read_ctx{pi, ctx};
+    system_properties.ReadCallback(pi, foreach_read_callback, &read_ctx);
+}
+
 __BIONIC_WEAK_FOR_NATIVE_BRIDGE
 int __system_property_foreach(void (*propfn)(const prop_info* pi, void* cookie), void* cookie) {
-  return system_properties.Foreach(propfn, cookie);
+    if (!propfn) return -1;
+    ForeachOverrideCtx ctx{propfn, cookie};
+    return system_properties.Foreach(foreach_callback_intercept, &ctx);
 }
 
 __BIONIC_WEAK_FOR_NATIVE_BRIDGE
